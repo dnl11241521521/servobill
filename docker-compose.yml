@@ -1,109 +1,84 @@
-# this dockerfile spins up the dependencies for local development.
-# for production deployments, see the deploy/dockerized/docker-compose.yml file.
 version: '3.8'
+
 services:
-  servobill-init:
-    image: node:lts
-    container_name: 'servobill-dev-init'
-    # # This image stops after it has done it's job
-    # restart: never
-    environment:
-      AWS_DEFAULT_REGION: eu-central-1
-      AWS_ACCESS_KEY_ID: AKIAIOSFODNN7EXAMPLE
-      AWS_SECRET_ACCESS_KEY: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
-      ENDPOINT_S3: http://servobill-s3:9000
-      ENDPOINT_DYNAMODB: http://servobill-dynamodb:9321
-      ENDPOINT_SES: http://servobill-ses:9330
-    volumes:
-      - ./stack/local/initialize:/src
-      - initializer-modules:/src/node_modules
-
-    depends_on:
-      # - servobill-dynamodb
-      - servobill-s3
-    working_dir: /src
-    entrypoint: /bin/bash -c "export NODE_ENV=development && echo 'npm install' && npm i && echo 'npm install done' && echo 'Starting Script' && npm run start"
-
-  servobill-dynamodb:
-    command: "-jar DynamoDBLocal.jar -sharedDb -dbPath ./data -port 9321"
-    image: "amazon/dynamodb-local:latest"
+  postgres:
+    image: postgres:15-alpine
+    container_name: servobill-postgres
     restart: unless-stopped
+    environment:
+      POSTGRES_DB: servobill
+      POSTGRES_USER: servobill
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U servobill"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-    platform: linux/amd64
-    container_name: servobill-dev-dynamodb-local
-    user: root
+  app:
+    image: ghcr.io/kellertobias/servobill:latest
+    container_name: servobill-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Node
+      NODE_ENV: production
+      
+      # Database
+      DATABASE_URL: postgresql://servobill:${DB_PASSWORD}@postgres:5432/servobill
+      DATABASE_TYPE: postgres
+      
+      # Auth
+      NEXTAUTH_URL: https://tax.danielschloss.de
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      
+      # Access Control
+      ALLOWED_EMAILS: ${ALLOWED_EMAILS}
+      
+      # Storage (lokal - einfachste Option)
+      STORAGE_TYPE: local
+      LOCAL_STORAGE_PATH: /app/storage
+      
+      # API URL
+      NEXT_PUBLIC_API_URL: https://tax.danielschloss.de/api
+      
+      # Email (SMTP)
+      MAIL_PROVIDER: smtp
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-noreply@danielschloss.de}
+      
+    volumes:
+      - app_storage:/app/storage
     ports:
       - "9321:9321"
-    volumes:
-      - dynamodb-data:/home/dynamodblocal/data
-    working_dir: /home/dynamodblocal
 
-  servobill-s3:
-    image: quay.io/minio/minio
+  worker:
+    image: ghcr.io/kellertobias/servobill:latest
+    container_name: servobill-worker
     restart: unless-stopped
-    container_name: 'servobill-dev-s3'
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: npm run worker
     environment:
-      MINIO_ACCESS_KEY: AKIAIOSFODNN7EXAMPLE
-      MINIO_SECRET_KEY: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
-      MINIO_API_CORS_ALLOW_ORIGIN: '*'
-    ports:
-      - "9000:9000" # API Port
-      - "9320:9320" # Web Console Port
-    command: server /data --console-address ":9320"
+      NODE_ENV: production
+      DATABASE_URL: postgresql://servobill:${DB_PASSWORD}@postgres:5432/servobill
+      DATABASE_TYPE: postgres
+      STORAGE_TYPE: local
+      LOCAL_STORAGE_PATH: /app/storage
     volumes:
-      - s3-data:/data
-
-  # Enable this once we need SQS
-  # # === SQS Simulation - Checkout: https://hub.docker.com/r/roribio16/alpine-sqs/
-  # servobill-sqs:
-  #   image: softwaremill/elasticmq-native
-  #   restart: unless-stopped
-  #   container_name: 'servobill-sqs'
-  #   ports:
-  #     - "9324:9324"
-  #     - "9325:9325"
-
-  servobill-ses:
-    image: bh42/aws-ses-local
-    platform: linux/amd64
-    restart: unless-stopped
-    container_name: 'servobill-dev-ses'
-    ports:
-      - "9330:9330"
-    volumes:
-      - .emails:/opt/output
-    command: 'aws-ses-local --outputDir /opt/output --port 9330'
-
-  servobill-smtp:
-    image: haravich/fake-smtp-server
-    platform: linux/amd64
-    restart: unless-stopped
-    container_name: servobill-dev-smtp
-    ports:
-      - "1025:1025" # SMTP Port
-      - "1080:1080" # Web Console Port
-
-  # ---
-  # Postgres connection URL for local development:
-  # postgres://servobill:servobill@localhost:5432/servobill
-  # Format: postgres://<user>:<password>@<host>:<port>/<database>
-  # ---
-  servobill-postgres:
-    image: postgres:15
-    restart: unless-stopped
-    container_name: servobill-dev-postgres
-    environment:
-      POSTGRES_USER: servobill
-      POSTGRES_PASSWORD: servobill
-      POSTGRES_DB: servobill
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    # You can connect to this DB at localhost:5432 with user/pass servobill/servobill
+      - app_storage:/app/storage
 
 volumes:
-  initializer-modules: {}
-  s3-data: {}
-  dynamodb-data: {}
-  postgres-data: {}
+  postgres_data:
+  app_storage:
